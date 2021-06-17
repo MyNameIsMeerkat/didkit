@@ -29,3 +29,4 @@ pub use ssi::vc::LinkedDataProofOptions;
 pub use ssi::vc::Presentation as VerifiablePresentation;
 pub use ssi::vc::ProofPurpose;
 pub use ssi::vc::VerificationResult;
+pub use ssi::zcap::Delegation;
