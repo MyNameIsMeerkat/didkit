@@ -1,18 +1,19 @@
 use std::fs::File;
-use std::io::Write;
-use std::io::{stdin, stdout, BufReader, BufWriter};
+use std::io::{stdin, stdout, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use chrono::prelude::*;
 use serde::Serialize;
 use serde_json::Value;
+use sshkeys::PublicKey;
 use structopt::{clap::AppSettings, clap::ArgGroup, StructOpt};
 
 use did_method_key::DIDKey;
+use didkit::generate_proof;
 use didkit::{
     dereference, get_verification_method, runtime, DIDMethod, DIDResolver,
-    DereferencingInputMetadata, Error, LinkedDataProofOptions, Metadata, ProofPurpose,
+    DereferencingInputMetadata, Error, LinkedDataProofOptions, Metadata, ProofFormat, ProofPurpose,
     ResolutionInputMetadata, ResolutionResult, Source, VerifiableCredential,
     VerifiablePresentation, DID_METHODS, JWK,
 };
@@ -39,6 +40,12 @@ pub enum DIDKit {
         method_pattern: Option<String>,
         #[structopt(flatten)]
         key: KeyArg,
+    },
+    /// Convert a SSH public key to a JWK
+    SshPkToJwk {
+        #[structopt(parse(try_from_str=PublicKey::from_string))]
+        /// SSH Public Key
+        ssh_pk: PublicKey,
     },
 
     /*
@@ -147,7 +154,9 @@ pub enum DIDKit {
 }
 
 #[derive(StructOpt, Debug)]
+#[non_exhaustive]
 pub struct ProofOptions {
+    // Options as in vc-http-api
     #[structopt(env, short, long)]
     pub verification_method: Option<String>,
     #[structopt(env, short, long)]
@@ -158,10 +167,14 @@ pub struct ProofOptions {
     pub challenge: Option<String>,
     #[structopt(env, short, long)]
     pub domain: Option<String>,
+
+    // Non-standard options
+    #[structopt(env, default_value, short = "f", long)]
+    pub proof_format: ProofFormat,
 }
 
 #[derive(StructOpt, Debug)]
-#[structopt(group = ArgGroup::with_name("key_group").required(true))]
+#[structopt(group = ArgGroup::with_name("key_group").multiple(true).required(true))]
 pub struct KeyArg {
     #[structopt(env, short, long, parse(from_os_str), group = "key_group")]
     key_path: Option<PathBuf>,
@@ -176,17 +189,24 @@ pub struct KeyArg {
         help = "WARNING: you should not use this through the CLI in a production environment, prefer its environment variable."
     )]
     jwk: Option<JWK>,
+    /// Request signature using SSH Agent
+    #[structopt(short = "S", long, group = "key_group")]
+    ssh_agent: bool,
 }
 
 impl KeyArg {
     fn get_jwk(&self) -> JWK {
+        self.get_jwk_opt()
+            .expect("Key path or JWK option is required")
+    }
+    fn get_jwk_opt(&self) -> Option<JWK> {
         match &self.key_path {
             Some(p) => {
                 let key_file = File::open(p).unwrap();
                 let key_reader = BufReader::new(key_file);
-                serde_json::from_reader(key_reader).unwrap()
+                Some(serde_json::from_reader(key_reader).unwrap())
             }
-            None => self.jwk.clone().unwrap(),
+            None => self.jwk.clone(),
         }
     }
 }
@@ -288,9 +308,31 @@ mod tests {
     }
 }
 
+fn ssh_auth_sock_err() {
+    eprintln!(
+        r#"didkit: missing SSH_AUTH_SOCK environmental variable for SSH Agent usage.
+To use DIDKit with SSH Agent, ssh-agent must be running and $SSH_AUTH_SOCK
+set. For more info, see the manual for ssh-agent(1) and ssh-add(1).
+"#
+    );
+    std::process::exit(1);
+}
+
 fn main() {
     let rt = runtime::get().unwrap();
     let opt = DIDKit::from_args();
+
+    use std::env::VarError;
+    let ssh_agent_sock = match std::env::var("SSH_AUTH_SOCK") {
+        Ok(string) => Some(string),
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(_)) => panic!("Unable to parse SSH_AUTH_SOCK"),
+    };
+    let ssh_agent_sock_opt = match ssh_agent_sock {
+        Some(ref path) => Some(&path[..]),
+        None => None,
+    };
+
     match opt {
         DIDKit::GenerateEd25519Key => {
             let jwk = JWK::generate_ed25519().unwrap();
@@ -321,6 +363,12 @@ fn main() {
             println!("{}", did);
         }
 
+        DIDKit::SshPkToJwk { ssh_pk } => {
+            let jwk = ssi::ssh::ssh_pkk_to_jwk(&ssh_pk.kind).unwrap();
+            let stdout_writer = BufWriter::new(stdout());
+            serde_json::to_writer_pretty(stdout_writer, &jwk).unwrap();
+        }
+
         DIDKit::KeyToVerificationMethod {
             method_pattern,
             key,
@@ -348,17 +396,42 @@ fn main() {
         }
 
         DIDKit::VCIssueCredential { key, proof_options } => {
-            let key: JWK = key.get_jwk();
             let credential_reader = BufReader::new(stdin());
             let mut credential: VerifiableCredential =
                 serde_json::from_reader(credential_reader).unwrap();
+            let proof_format = proof_options.proof_format.clone();
+            let jwk_opt: Option<JWK> = key.get_jwk_opt();
+            if key.ssh_agent && ssh_agent_sock.is_none() {
+                ssh_auth_sock_err();
+            }
             let options = LinkedDataProofOptions::from(proof_options);
-            let proof = rt
-                .block_on(credential.generate_proof(&key, &options))
-                .unwrap();
-            credential.add_proof(proof);
-            let stdout_writer = BufWriter::new(stdout());
-            serde_json::to_writer(stdout_writer, &credential).unwrap();
+            match proof_format {
+                ProofFormat::JWT => {
+                    if ssh_agent_sock_opt.is_some() {
+                        todo!("ssh-agent for JWT not implemented");
+                    }
+                    let jwt = rt
+                        .block_on(credential.generate_jwt(jwk_opt.as_ref(), &options))
+                        .unwrap();
+                    print!("{}", jwt);
+                }
+                ProofFormat::LDP => {
+                    let proof = rt
+                        .block_on(generate_proof(
+                            &credential,
+                            jwk_opt.as_ref(),
+                            options,
+                            ssh_agent_sock_opt,
+                        ))
+                        .unwrap();
+                    credential.add_proof(proof);
+                    let stdout_writer = BufWriter::new(stdout());
+                    serde_json::to_writer(stdout_writer, &credential).unwrap();
+                }
+                _ => {
+                    panic!("Unknown proof format: {:?}", proof_format);
+                }
+            }
         }
 
         DIDKit::VCVerifyCredential {
@@ -366,12 +439,30 @@ fn main() {
             resolver_options,
         } => {
             let resolver = resolver_options.to_resolver();
-            let credential_reader = BufReader::new(stdin());
-            let credential: VerifiableCredential =
-                serde_json::from_reader(credential_reader).unwrap();
+            let mut credential_reader = BufReader::new(stdin());
+            let proof_format = proof_options.proof_format.clone();
             let options = LinkedDataProofOptions::from(proof_options);
-            credential.validate_unsigned().unwrap();
-            let result = rt.block_on(credential.verify(Some(options), &resolver));
+            let result = match proof_format {
+                ProofFormat::JWT => {
+                    let mut jwt = String::new();
+                    credential_reader.read_to_string(&mut jwt).unwrap();
+                    rt.block_on(VerifiableCredential::verify_jwt(
+                        &jwt,
+                        Some(options),
+                        &resolver,
+                    ))
+                }
+                ProofFormat::LDP => {
+                    let credential: VerifiableCredential =
+                        serde_json::from_reader(credential_reader).unwrap();
+                    credential.validate_unsigned().unwrap();
+                    rt.block_on(credential.verify(Some(options), &resolver))
+                }
+                _ => {
+                    panic!("Unknown proof format: {:?}", proof_format);
+                }
+            };
+
             let stdout_writer = BufWriter::new(stdout());
             serde_json::to_writer(stdout_writer, &result).unwrap();
             if result.errors.len() > 0 {
@@ -380,17 +471,42 @@ fn main() {
         }
 
         DIDKit::VCIssuePresentation { key, proof_options } => {
-            let key: JWK = key.get_jwk();
             let presentation_reader = BufReader::new(stdin());
             let mut presentation: VerifiablePresentation =
                 serde_json::from_reader(presentation_reader).unwrap();
+            let jwk_opt: Option<JWK> = key.get_jwk_opt();
+            if key.ssh_agent && ssh_agent_sock.is_none() {
+                ssh_auth_sock_err();
+            }
+            let proof_format = proof_options.proof_format.clone();
             let options = LinkedDataProofOptions::from(proof_options);
-            let proof = rt
-                .block_on(presentation.generate_proof(&key, &options))
-                .unwrap();
-            presentation.add_proof(proof);
-            let stdout_writer = BufWriter::new(stdout());
-            serde_json::to_writer(stdout_writer, &presentation).unwrap();
+            match proof_format {
+                ProofFormat::JWT => {
+                    if ssh_agent_sock_opt.is_some() {
+                        todo!("ssh-agent for JWT not implemented");
+                    }
+                    let jwt = rt
+                        .block_on(presentation.generate_jwt(jwk_opt.as_ref(), &options))
+                        .unwrap();
+                    print!("{}", jwt);
+                }
+                ProofFormat::LDP => {
+                    let proof = rt
+                        .block_on(generate_proof(
+                            &presentation,
+                            jwk_opt.as_ref(),
+                            options,
+                            ssh_agent_sock_opt,
+                        ))
+                        .unwrap();
+                    presentation.add_proof(proof);
+                    let stdout_writer = BufWriter::new(stdout());
+                    serde_json::to_writer(stdout_writer, &presentation).unwrap();
+                }
+                _ => {
+                    panic!("Unexpected proof format: {:?}", proof_format);
+                }
+            }
         }
 
         DIDKit::VCVerifyPresentation {
@@ -398,12 +514,29 @@ fn main() {
             resolver_options,
         } => {
             let resolver = resolver_options.to_resolver();
-            let presentation_reader = BufReader::new(stdin());
-            let presentation: VerifiablePresentation =
-                serde_json::from_reader(presentation_reader).unwrap();
+            let mut presentation_reader = BufReader::new(stdin());
+            let proof_format = proof_options.proof_format.clone();
             let options = LinkedDataProofOptions::from(proof_options);
-            presentation.validate_unsigned().unwrap();
-            let result = rt.block_on(presentation.verify(Some(options), &resolver));
+            let result = match proof_format {
+                ProofFormat::JWT => {
+                    let mut jwt = String::new();
+                    presentation_reader.read_to_string(&mut jwt).unwrap();
+                    rt.block_on(VerifiablePresentation::verify_jwt(
+                        &jwt,
+                        Some(options),
+                        &resolver,
+                    ))
+                }
+                ProofFormat::LDP => {
+                    let presentation: VerifiablePresentation =
+                        serde_json::from_reader(presentation_reader).unwrap();
+                    presentation.validate_unsigned().unwrap();
+                    rt.block_on(presentation.verify(Some(options), &resolver))
+                }
+                _ => {
+                    panic!("Unexpected proof format: {:?}", proof_format);
+                }
+            };
             let stdout_writer = BufWriter::new(stdout());
             serde_json::to_writer(stdout_writer, &result).unwrap();
             if result.errors.len() > 0 {
@@ -512,16 +645,41 @@ fn main() {
             holder,
             proof_options,
         } => {
-            let key: JWK = key.get_jwk();
             let mut presentation = VerifiablePresentation::default();
             presentation.holder = Some(ssi::vc::URI::String(holder));
+            let proof_format = proof_options.proof_format.clone();
+            let jwk_opt: Option<JWK> = key.get_jwk_opt();
+            if key.ssh_agent && ssh_agent_sock.is_none() {
+                ssh_auth_sock_err();
+            }
             let options = LinkedDataProofOptions::from(proof_options);
-            let proof = rt
-                .block_on(presentation.generate_proof(&key, &options))
-                .unwrap();
-            presentation.add_proof(proof);
-            let stdout_writer = BufWriter::new(stdout());
-            serde_json::to_writer(stdout_writer, &presentation).unwrap();
+            match proof_format {
+                ProofFormat::JWT => {
+                    if ssh_agent_sock_opt.is_some() {
+                        todo!("ssh-agent for JWT not implemented");
+                    }
+                    let jwt = rt
+                        .block_on(presentation.generate_jwt(jwk_opt.as_ref(), &options))
+                        .unwrap();
+                    print!("{}", jwt);
+                }
+                ProofFormat::LDP => {
+                    let proof = rt
+                        .block_on(generate_proof(
+                            &presentation,
+                            jwk_opt.as_ref(),
+                            options,
+                            ssh_agent_sock_opt,
+                        ))
+                        .unwrap();
+                    presentation.add_proof(proof);
+                    let stdout_writer = BufWriter::new(stdout());
+                    serde_json::to_writer(stdout_writer, &presentation).unwrap();
+                }
+                _ => {
+                    panic!("Unexpected proof format: {:?}", proof_format);
+                }
+            }
         }
     }
 }
