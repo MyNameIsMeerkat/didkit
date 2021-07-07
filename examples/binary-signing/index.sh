@@ -2,6 +2,7 @@
 set -e
 prog=${0##*/}
 dir=${0%/*}
+export PATH="$dir/../../target/debug:$PATH"
 
 err() {
 	code=$1; shift
