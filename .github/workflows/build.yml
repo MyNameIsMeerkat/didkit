@@ -58,11 +58,6 @@ jobs:
     - name: Test HTTP server
       run: http/tests/example.sh
 
-    - name: Test CLI (did:tz)
-      env:
-        DID_METHOD: tz
-      run: cli/tests/example.sh
-
     - name: Test HTTP server (did:tz)
       env:
         DID_METHOD: tz
